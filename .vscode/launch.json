@@ -1,0 +1,23 @@
+﻿{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "FastAPI: Run NILM Backend (Simulation)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/backend.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "FastAPI: Run NILM Backend (Serial Mode)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/backend.py",
+            "env": {
+                "SIMULATION_MODE": "False",
+                "SERIAL_PORT": "COM3"
+            },
+            "console": "integratedTerminal"
+        }
+    ]
+}
