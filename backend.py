@@ -32,7 +32,7 @@ import uvicorn
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-SIMULATION_MODE = os.getenv("SIMULATION_MODE", "True").lower() in ("true", "1", "yes")
+SIMULATION_MODE = os.getenv("SIMULATION_MODE", "False").lower() in ("true", "1", "yes")
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM3")
 SERIAL_BAUDRATE = int(os.getenv("SERIAL_BAUDRATE", "115200"))
 DELTA_I_THRESHOLD = float(os.getenv("DELTA_I_THRESHOLD", "0.15"))  # RMS current jump trigger (Amps)
@@ -566,13 +566,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Error] Failed to train Decision Tree: {e}")
 
-    # 2. Launch Event-Based Stream Monitor
+    # 2. Launch Stream Monitor only if simulation mode is explicitly enabled
     if SIMULATION_MODE:
         worker_thread = threading.Thread(target=simulation_worker, daemon=True, name="SimulationWorker")
+        worker_thread.start()
+        print("[Server] Fake Simulation Worker STARTED.")
     else:
-        worker_thread = threading.Thread(target=serial_worker, daemon=True, name="SerialWorker")
-
-    worker_thread.start()
+        worker_thread = None
+        print("[Server] Real Wi-Fi Mode Active. Fake simulation is DISABLED. Waiting for Wokwi/ESP32...")
     yield
 
     # Shutdown

@@ -8,4 +8,4 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.0
       - key: SIMULATION_MODE
-        value: "true"
+        value: "false"
