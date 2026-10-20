@@ -29,6 +29,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
+import paho.mqtt.client as mqtt
+
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
@@ -68,6 +70,95 @@ labeler_thread = None
 data_lock = threading.Lock()
 event_queue: queue.Queue = queue.Queue()
 last_wifi_telemetry_time: float = 0.0
+
+# MQTT Configuration
+MQTT_BROKER = "broker.hivemq.com"
+MQTT_PORT = 1883
+MQTT_TOPIC = "nilm/pushkal/telemetry"
+mqtt_client_instance = None
+
+
+def process_mqtt_telemetry(payload_dict: dict):
+    """Process incoming MQTT telemetry exactly like the HTTP endpoint."""
+    global last_wifi_telemetry_time
+    last_wifi_telemetry_time = time.time()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    current_rms = float(payload_dict.get("current_rms", 0.0))
+    delta_i = float(payload_dict.get("delta_i", 0.0))
+    voltage = float(payload_dict.get("voltage", 230.0))
+    accel_x = float(payload_dict.get("accel_x", 0.0))
+    accel_y = float(payload_dict.get("accel_y", 0.0))
+    accel_z = float(payload_dict.get("accel_z", 1.0))
+    gyro_x = float(payload_dict.get("gyro_x", 0.0))
+    gyro_y = float(payload_dict.get("gyro_y", 0.0))
+    gyro_z = float(payload_dict.get("gyro_z", 0.0))
+    vib_mag = float(payload_dict.get("vibration_magnitude", 0.0))
+    if vib_mag == 0.0:
+        vib_mag = round(math.sqrt(accel_x**2 + accel_y**2 + accel_z**2), 4)
+
+    predicted_appliance = payload_dict.get("predicted_appliance", "")
+    confidence_val = float(payload_dict.get("confidence", 1.0))
+    device_id = payload_dict.get("device_id", "wokwi-esp32")
+
+    imu_data = {
+        "accel_x_g": accel_x, "accel_y_g": accel_y, "accel_z_g": accel_z,
+        "gyro_x_dps": gyro_x, "gyro_y_dps": gyro_y, "gyro_z_dps": gyro_z,
+        "vibration_magnitude_g": vib_mag,
+    }
+
+    if predicted_appliance and predicted_appliance.strip() not in ("", "Unknown"):
+        pred_label = predicted_appliance.strip()
+        confidence = confidence_val
+        model_source = "TinyML ESP32 (inference.h)"
+    else:
+        pred_label, confidence = run_live_inference(current_rms, delta_i, imu_data)
+        model_source = "DecisionTreeClassifier (Cloud)"
+
+    classified_apps = apply_inference_to_appliances(pred_label, current_rms)
+
+    with data_lock:
+        latest_data["timestamp"] = now_iso
+        latest_data["mode"] = f"mqtt ({device_id})"
+        latest_data["total_current_rms"] = round(current_rms, 3)
+        latest_data["delta_i"] = round(delta_i, 3)
+        latest_data["voltage_rms"] = round(voltage, 1)
+        latest_data["appliances"] = classified_apps
+        latest_data["ml_inference"] = {
+            "predicted_appliance": pred_label,
+            "confidence": round(confidence, 3),
+            "model": model_source,
+            "last_inference_time": now_iso,
+        }
+
+    print(f"[MQTT TELEMETRY] Node: {device_id} | I: {current_rms:.2f}A | dI: {delta_i:+.2f}A | Prediction -> {pred_label} ({confidence*100:.1f}%)")
+
+
+def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
+    print(f"[MQTT] Connected to {MQTT_BROKER}:{MQTT_PORT} (rc={reason_code})")
+    client.subscribe(MQTT_TOPIC)
+    print(f"[MQTT] Subscribed to topic: {MQTT_TOPIC}")
+
+
+def on_mqtt_message(client, userdata, msg):
+    try:
+        payload_dict = json.loads(msg.payload.decode("utf-8"))
+        process_mqtt_telemetry(payload_dict)
+    except Exception as e:
+        print(f"[MQTT Error] Failed to parse message: {e}")
+
+
+def start_mqtt_subscriber():
+    global mqtt_client_instance
+    try:
+        mqtt_client_instance = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        mqtt_client_instance.on_connect = on_mqtt_connect
+        mqtt_client_instance.on_message = on_mqtt_message
+        mqtt_client_instance.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client_instance.loop_start()
+        print(f"[MQTT] Subscriber thread started -> {MQTT_BROKER}:{MQTT_PORT} topic={MQTT_TOPIC}")
+    except Exception as e:
+        print(f"[MQTT Error] Could not connect to broker: {e}")
 
 # Shared state store
 latest_data: Dict[str, Any] = {
@@ -357,6 +448,15 @@ def apply_inference_to_appliances(pred_label: str, total_current: float):
     """
     Updates the shared appliance states based on the Decision Tree prediction.
     """
+    # Robustness fallback: reconcile label with total RMS current level
+    if total_current < 0.20:
+        pred_label = "Standby"
+    elif pred_label == "Standby":
+        if total_current >= 2.50:
+            pred_label = "Electric Iron"
+        else:
+            pred_label = "Fast Charger"
+
     # Base states
     new_appliances = {
         "Ceiling Fan": {"current_rms": 0.0, "status": "OFF"},
@@ -574,10 +674,17 @@ async def lifespan(app: FastAPI):
     else:
         worker_thread = None
         print("[Server] Real Wi-Fi Mode Active. Fake simulation is DISABLED. Waiting for Wokwi/ESP32...")
+
+    # 3. Start MQTT subscriber (always, listens for ESP32 telemetry via MQTT)
+    start_mqtt_subscriber()
+
     yield
 
     # Shutdown
     stop_event.set()
+    if mqtt_client_instance:
+        mqtt_client_instance.loop_stop()
+        mqtt_client_instance.disconnect()
     if worker_thread and worker_thread.is_alive():
         worker_thread.join(timeout=2.0)
 
