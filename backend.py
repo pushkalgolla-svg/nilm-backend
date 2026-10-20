@@ -357,6 +357,15 @@ def apply_inference_to_appliances(pred_label: str, total_current: float):
     """
     Updates the shared appliance states based on the Decision Tree prediction.
     """
+    # Robustness fallback: reconcile label with total RMS current level
+    if total_current < 0.20:
+        pred_label = "Standby"
+    elif pred_label == "Standby":
+        if total_current >= 2.50:
+            pred_label = "Electric Iron"
+        else:
+            pred_label = "Fast Charger"
+
     # Base states
     new_appliances = {
         "Ceiling Fan": {"current_rms": 0.0, "status": "OFF"},
