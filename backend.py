@@ -76,6 +76,7 @@ MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
 MQTT_TOPIC = "nilm/pushkal/telemetry"
 mqtt_client_instance = None
+mqtt_status_info = {"connected": False, "error": None, "last_msg": None}
 
 
 def process_mqtt_telemetry(payload_dict: dict):
@@ -135,6 +136,8 @@ def process_mqtt_telemetry(payload_dict: dict):
 
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
+    mqtt_status_info["connected"] = True
+    mqtt_status_info["rc"] = str(reason_code)
     print(f"[MQTT] Connected to {MQTT_BROKER}:{MQTT_PORT} (rc={reason_code})")
     client.subscribe(MQTT_TOPIC)
     print(f"[MQTT] Subscribed to topic: {MQTT_TOPIC}")
@@ -142,9 +145,12 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
 
 def on_mqtt_message(client, userdata, msg):
     try:
-        payload_dict = json.loads(msg.payload.decode("utf-8"))
+        raw_str = msg.payload.decode("utf-8")
+        mqtt_status_info["last_msg"] = raw_str
+        payload_dict = json.loads(raw_str)
         process_mqtt_telemetry(payload_dict)
     except Exception as e:
+        mqtt_status_info["error"] = str(e)
         print(f"[MQTT Error] Failed to parse message: {e}")
 
 
@@ -158,6 +164,8 @@ def start_mqtt_subscriber():
         mqtt_client_instance.loop_start()
         print(f"[MQTT] Subscriber thread started -> {MQTT_BROKER}:{MQTT_PORT} topic={MQTT_TOPIC}")
     except Exception as e:
+        mqtt_status_info["error"] = str(e)
+        print(f"[MQTT Error] Failed to start subscriber: {e}")
         print(f"[MQTT Error] Could not connect to broker: {e}")
 
 # Shared state store
@@ -727,7 +735,11 @@ def health_check():
         "simulation_mode": SIMULATION_MODE,
         "worker_active": worker_thread.is_alive() if worker_thread else False,
         "model_loaded": trained_classifier is not None,
-        "mode": latest_data.get("mode")
+        "mode": latest_data.get("mode"),
+        "mqtt": {
+            "connected": mqtt_client_instance.is_connected() if mqtt_client_instance else False,
+            "info": mqtt_status_info
+        }
     }
 
 
