@@ -125,6 +125,7 @@ def process_mqtt_telemetry(payload_dict: dict):
         latest_data["delta_i"] = round(delta_i, 3)
         latest_data["voltage_rms"] = round(voltage, 1)
         latest_data["appliances"] = classified_apps
+        latest_data["imu"] = imu_data
         latest_data["ml_inference"] = {
             "predicted_appliance": pred_label,
             "confidence": round(confidence, 3),
@@ -175,6 +176,15 @@ latest_data: Dict[str, Any] = {
     "total_current_rms": 0.0,
     "delta_i": 0.0,
     "voltage_rms": 230.0,
+    "imu": {
+        "accel_x_g": 0.0,
+        "accel_y_g": 0.0,
+        "accel_z_g": 1.0,
+        "gyro_x_dps": 0.0,
+        "gyro_y_dps": 0.0,
+        "gyro_z_dps": 0.0,
+        "vibration_magnitude_g": 1.0,
+    },
     "ml_inference": {
         "predicted_appliance": "Standby",
         "confidence": 1.0,
@@ -806,6 +816,7 @@ def receive_telemetry(payload: TelemetryPayload):
         latest_data["delta_i"] = round(payload.delta_i, 3)
         latest_data["voltage_rms"] = round(payload.voltage, 1)
         latest_data["appliances"] = classified_apps
+        latest_data["imu"] = imu_data
         latest_data["ml_inference"] = {
             "predicted_appliance": pred_label,
             "confidence": round(confidence, 3),
@@ -854,6 +865,15 @@ def get_status():
             "total_current_a": total_current,
             "delta_i_a": latest_data.get("delta_i", 0.0),
             "total_power_w": total_power,
+            "imu": latest_data.get("imu", {
+                "accel_x_g": 0.0,
+                "accel_y_g": 0.0,
+                "accel_z_g": 1.0,
+                "gyro_x_dps": 0.0,
+                "gyro_y_dps": 0.0,
+                "gyro_z_dps": 0.0,
+                "vibration_magnitude_g": 1.0,
+            }),
             "ml_inference": latest_data.get("ml_inference"),
             "model_metrics": model_metrics,
             "appliance_states": appliance_states,
