@@ -75,8 +75,36 @@ last_wifi_telemetry_time: float = 0.0
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
 MQTT_TOPIC = "nilm/pushkal/telemetry"
+MQTT_TOPIC_CONTROL = "nilm/pushkal/control"
 mqtt_client_instance = None
 mqtt_status_info = {"connected": False, "error": None, "last_msg": None}
+breaker_status: str = "ARMED"
+session_start_time: float = time.time()
+peak_demand_w: float = 0.0
+appliance_runtimes_sec: Dict[str, float] = {
+    "Ceiling Fan": 0.0,
+    "Electric Iron": 0.0,
+    "Fast Charger": 0.0,
+}
+
+def get_tod_tariff_info() -> Dict[str, Any]:
+    hour = datetime.now().hour
+    if 18 <= hour < 22:
+        slot = "PEAK"
+        rate = 10.00
+    elif 22 <= hour or hour < 6:
+        slot = "OFF-PEAK"
+        rate = 5.00
+    else:
+        slot = "NORMAL"
+        rate = 7.50
+    return {
+        "rate_inr": rate,
+        "slot": slot,
+        "base_rate_inr": 7.50,
+        "peak_rate_inr": 10.00,
+        "off_peak_rate_inr": 5.00,
+    }
 
 # -----------------------------------------------------------------------------
 # Real-Time Energy, Financial, Health & Event Accounting
@@ -89,14 +117,26 @@ event_history: List[Dict[str, Any]] = []
 
 
 def update_analytics_and_events(current_rms: float, voltage: float, delta_i: float, pred_label: str, vib_mag: float, latency_us: int):
-    global accumulated_energy_kwh, last_energy_calc_time
+    global accumulated_energy_kwh, last_energy_calc_time, peak_demand_w
     now_ts = time.time()
-    dt_hours = max(0.0, (now_ts - last_energy_calc_time) / 3600.0)
-    if dt_hours > 0.05:  # Cap large gaps (e.g. sleep)
-        dt_hours = 0.0005
+    dt_sec = max(0.0, now_ts - last_energy_calc_time)
+    if dt_sec > 120.0:  # Cap large gaps
+        dt_sec = 1.0
+    dt_hours = dt_sec / 3600.0
     last_energy_calc_time = now_ts
 
     power_w = current_rms * voltage
+    if power_w > peak_demand_w:
+        peak_demand_w = round(power_w, 1)
+
+    # Accumulate duty cycle runtime for ON appliances
+    for app_name, app_info in latest_data.get("appliances", {}).items():
+        if app_info.get("status") == "ON" or app_info.get("state") == "ON":
+            appliance_runtimes_sec[app_name] = appliance_runtimes_sec.get(app_name, 0.0) + dt_sec
+
+    tod = get_tod_tariff_info()
+    effective_rate = tod["rate_inr"]
+
     accumulated_energy_kwh += (power_w / 1000.0) * dt_hours
 
     # Predictive Maintenance Assessment
@@ -127,10 +167,25 @@ def update_analytics_and_events(current_rms: float, voltage: float, delta_i: flo
         anomaly_status = "System Idle / Standby"
         bearing_fault = False
 
-    cost_inr = round(accumulated_energy_kwh * TARIFF_INR_PER_KWH, 2)
-    projected_monthly = round((power_w / 1000.0) * 24 * 30 * TARIFF_INR_PER_KWH, 2)
+    cost_inr = round(accumulated_energy_kwh * effective_rate, 2)
+    projected_monthly = round((power_w / 1000.0) * 24 * 30 * effective_rate, 2)
     carbon_kg = round(accumulated_energy_kwh * CARBON_FACTOR_KG_PER_KWH, 4)
     carbon_g = round(carbon_kg * 1000, 1)
+
+    # Potential savings if active heating load was shifted from Peak to Off-Peak
+    potential_savings_hourly = round(((power_w / 1000.0) * (tod["peak_rate_inr"] - tod["off_peak_rate_inr"])), 2)
+
+    total_session_sec = max(1.0, now_ts - session_start_time)
+    duty_cycles = {}
+    for app_name, sec_val in appliance_runtimes_sec.items():
+        mins = int(sec_val // 60)
+        hrs = int(mins // 60)
+        rem_mins = mins % 60
+        duty_cycles[app_name] = {
+            "runtime_seconds": round(sec_val, 1),
+            "runtime_str": f"{hrs}h {rem_mins}m" if hrs > 0 else f"{rem_mins}m {int(sec_val % 60)}s",
+            "duty_cycle_pct": round(min(100.0, (sec_val / total_session_sec) * 100.0), 1),
+        }
 
     # Log event if delta_i represents a state jump or first event
     if abs(delta_i) >= 0.15 or len(event_history) == 0:
@@ -153,7 +208,11 @@ def update_analytics_and_events(current_rms: float, voltage: float, delta_i: flo
     return {
         "energy_kwh": round(accumulated_energy_kwh, 5),
         "cost_inr": cost_inr,
-        "tariff_rate_inr": TARIFF_INR_PER_KWH,
+        "tariff_rate_inr": effective_rate,
+        "tod_tariff": tod,
+        "potential_savings_hourly_inr": potential_savings_hourly,
+        "duty_cycles": duty_cycles,
+        "peak_demand_w": peak_demand_w,
         "projected_monthly_inr": projected_monthly,
         "carbon_kg": carbon_kg,
         "carbon_g": carbon_g,
@@ -210,13 +269,18 @@ def process_mqtt_telemetry(payload_dict: dict):
         pred_label, confidence = run_live_inference(current_rms, delta_i, imu_data)
         model_source = "DecisionTreeClassifier (Cloud)"
 
-    classified_apps = apply_inference_to_appliances(pred_label, current_rms)
+    global breaker_status
+    if "breaker_status" in payload_dict:
+        breaker_status = payload_dict["breaker_status"]
+
+    classified_apps = apply_inference_to_appliances(pred_label, current_rms, imu_data)
     latency_us = int(payload_dict.get("inference_latency_us", random.randint(12, 17)))
     analytics = update_analytics_and_events(current_rms, voltage, delta_i, pred_label, vib_mag, latency_us)
 
     with data_lock:
         latest_data["timestamp"] = now_iso
         latest_data["mode"] = f"mqtt ({device_id})"
+        latest_data["breaker_status"] = breaker_status
         latest_data["total_current_rms"] = round(current_rms, 3)
         latest_data["delta_i"] = round(delta_i, 3)
         latest_data["voltage_rms"] = round(voltage, 1)
@@ -561,47 +625,60 @@ def run_live_inference(total_current: float, delta_i: float, imu_data: Dict[str,
     return pred_label, confidence
 
 
-def apply_inference_to_appliances(pred_label: str, total_current: float):
+def apply_inference_to_appliances(pred_label: str, total_current: float, imu_data: Optional[Dict[str, float]] = None):
     """
-    Updates the shared appliance states based on the Decision Tree prediction.
+    Intelligent Combinatorial NILM decomposition.
+    Separates concurrent aggregate loads (e.g. Iron + Fan + Charger running simultaneously).
     """
-    # Robustness fallback: reconcile label with total RMS current level
-    if total_current < 0.20:
-        pred_label = "Standby"
-    elif pred_label == "Standby":
-        if total_current >= 2.50:
-            pred_label = "Electric Iron"
-        else:
-            pred_label = "Fast Charger"
-
-    # Base states
+    global breaker_status
     new_appliances = {
         "Ceiling Fan": {"current_rms": 0.0, "status": "OFF"},
         "Electric Iron": {"current_rms": 0.0, "status": "OFF"},
         "Fast Charger": {"current_rms": 0.0, "status": "OFF"},
     }
 
-    if pred_label == "Electric Iron":
+    if total_current < 0.20 or breaker_status == "TRIPPED":
+        return new_appliances
+
+    gyro_y = imu_data.get("gyro_y_dps", 0.0) if imu_data else 0.0
+    has_motor_vibration = (gyro_y <= -0.58)
+
+    # 1. High Thermal Heating Load (Electric Iron) >= 4.50 A
+    if total_current >= 4.50:
         new_appliances["Electric Iron"]["status"] = "ON"
-        new_appliances["Electric Iron"]["current_rms"] = round(min(total_current, 5.65), 2)
-        # Background fan/charger if load is high enough
-        if total_current >= 6.0:
+        new_appliances["Electric Iron"]["current_rms"] = 5.50
+        remaining_current = total_current - 5.50
+
+        # Simultaneous Ceiling Fan if vibration slider is engaged or remaining current fits
+        if has_motor_vibration or remaining_current >= 0.35:
             new_appliances["Ceiling Fan"]["status"] = "ON"
             new_appliances["Ceiling Fan"]["current_rms"] = 0.38
-        if total_current >= 6.2:
+            remaining_current -= 0.38
+
+        # Simultaneous Fast Charger if remaining current fits
+        if remaining_current >= 0.18:
             new_appliances["Fast Charger"]["status"] = "ON"
             new_appliances["Fast Charger"]["current_rms"] = 0.22
 
-    elif pred_label == "Ceiling Fan":
-        new_appliances["Ceiling Fan"]["status"] = "ON"
-        new_appliances["Ceiling Fan"]["current_rms"] = round(min(total_current, 0.40), 2)
-        if total_current >= 0.55:
+    # 2. Composite Fan + Charger Load >= 0.55 A
+    elif total_current >= 0.55:
+        if has_motor_vibration:
+            new_appliances["Ceiling Fan"]["status"] = "ON"
+            new_appliances["Ceiling Fan"]["current_rms"] = 0.38
             new_appliances["Fast Charger"]["status"] = "ON"
-            new_appliances["Fast Charger"]["current_rms"] = 0.22
+            new_appliances["Fast Charger"]["current_rms"] = round(total_current - 0.38, 2)
+        else:
+            new_appliances["Fast Charger"]["status"] = "ON"
+            new_appliances["Fast Charger"]["current_rms"] = round(min(total_current, 0.40), 2)
 
-    elif pred_label == "Fast Charger":
-        new_appliances["Fast Charger"]["status"] = "ON"
-        new_appliances["Fast Charger"]["current_rms"] = round(min(total_current, 0.25), 2)
+    # 3. Single Sub-load (0.20 A to 0.55 A)
+    elif total_current >= 0.20:
+        if has_motor_vibration or pred_label == "Ceiling Fan":
+            new_appliances["Ceiling Fan"]["status"] = "ON"
+            new_appliances["Ceiling Fan"]["current_rms"] = round(total_current, 2)
+        else:
+            new_appliances["Fast Charger"]["status"] = "ON"
+            new_appliances["Fast Charger"]["current_rms"] = round(total_current, 2)
 
     return new_appliances
 
@@ -907,13 +984,14 @@ def receive_telemetry(payload: TelemetryPayload):
         pred_label, confidence = run_live_inference(payload.current_rms, payload.delta_i, imu_data)
         model_source = "DecisionTreeClassifier (Cloud)"
 
-    classified_apps = apply_inference_to_appliances(pred_label, payload.current_rms)
+    classified_apps = apply_inference_to_appliances(pred_label, payload.current_rms, imu_data)
     latency_us = int(payload.inference_latency_us or random.randint(12, 17))
     analytics = update_analytics_and_events(payload.current_rms, payload.voltage, payload.delta_i, pred_label, vib_mag, latency_us)
 
     with data_lock:
         latest_data["timestamp"] = now_iso
         latest_data["mode"] = f"wifi ({payload.device_id})"
+        latest_data["breaker_status"] = breaker_status
         latest_data["total_current_rms"] = round(payload.current_rms, 3)
         latest_data["delta_i"] = round(payload.delta_i, 3)
         latest_data["voltage_rms"] = round(payload.voltage, 1)
@@ -941,6 +1019,43 @@ def receive_telemetry(payload: TelemetryPayload):
     }
 
 
+class ControlPayload(BaseModel):
+    command: str = Field(..., description="Control command: TRIP or RESET")
+
+
+@app.post("/api/control")
+def send_control_command(payload: ControlPayload):
+    """
+    Two-Way IoT Cloud-to-Edge Remote Control.
+    Sends load shedding / breaker trip commands to ESP32 over MQTT.
+    """
+    global breaker_status
+    cmd = payload.command.upper().strip()
+    if cmd in ("TRIP", "SHED"):
+        breaker_status = "TRIPPED"
+        msg = "TRIP"
+    else:
+        breaker_status = "ARMED"
+        msg = "RESET"
+
+    if mqtt_client_instance:
+        try:
+            mqtt_client_instance.publish(MQTT_TOPIC_CONTROL, msg)
+            print(f"[CONTROL] Published MQTT remote control command: {msg} -> {MQTT_TOPIC_CONTROL}")
+        except Exception as e:
+            print(f"[CONTROL Error] Failed to publish MQTT control message: {e}")
+
+    with data_lock:
+        latest_data["breaker_status"] = breaker_status
+
+    return {
+        "status": "success",
+        "command": msg,
+        "breaker_status": breaker_status,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
 @app.get("/api/status")
 def get_status():
     """Returns live telemetry, latest Delta-I jump, ML prediction, and appliance states."""
@@ -962,10 +1077,17 @@ def get_status():
                 "power_w": power_w,
             }
 
+        tod_info = latest_data.get("analytics", {}).get("tod_tariff", get_tod_tariff_info())
+        duty_cycles = latest_data.get("analytics", {}).get("duty_cycles", {})
+
         return {
             "timestamp": latest_data.get("timestamp"),
             "simulation_mode": SIMULATION_MODE,
             "mode": latest_data.get("mode"),
+            "breaker_status": latest_data.get("breaker_status", breaker_status),
+            "peak_demand_kw": round(peak_demand_w / 1000.0, 3),
+            "tod_tariff": tod_info,
+            "duty_cycles": duty_cycles,
             "voltage_v": voltage,
             "total_current_a": total_current,
             "delta_i_a": latest_data.get("delta_i", 0.0),
@@ -986,6 +1108,10 @@ def get_status():
                 "projected_monthly_inr": 0.0,
                 "carbon_kg": 0.0,
                 "carbon_g": 0.0,
+                "tod_tariff": tod_info,
+                "potential_savings_hourly_inr": 0.0,
+                "duty_cycles": duty_cycles,
+                "peak_demand_w": peak_demand_w,
             }),
             "predictive_maintenance": latest_data.get("predictive_maintenance", {
                 "health_score": 100,
