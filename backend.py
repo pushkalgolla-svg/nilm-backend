@@ -104,11 +104,17 @@ appliance_runtimes_sec: Dict[str, float] = {
 # -----------------------------------------------------------------------------
 # SQLite Database Persistence Layer
 # -----------------------------------------------------------------------------
+def get_db_conn():
+    """Returns a thread-safe connection to SQLite with a 10s busy timeout."""
+    return sqlite3.connect(DB_PATH, timeout=10.0)
+
+
 def init_db():
-    """Initializes persistent SQLite database tables."""
+    """Initializes persistent SQLite database tables with WAL mode for concurrency."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS telemetry_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,7 +156,7 @@ def init_db():
                 )
             """)
             conn.commit()
-            print(f"[SQLite] Database initialized at {DB_PATH}")
+            print(f"[SQLite] Database initialized at {DB_PATH} with WAL journal mode.")
     except Exception as e:
         print(f"[SQLite Init Error] {e}")
 
@@ -158,7 +164,7 @@ def init_db():
 def load_events_from_db(limit: int = 50) -> List[Dict[str, Any]]:
     """Loads existing persisted events to populate in-memory history on startup."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT id, timestamp, appliance, current_a, delta_i_a, power_w, vibration_g, latency_us, status, health_status
@@ -188,7 +194,7 @@ def load_events_from_db(limit: int = 50) -> List[Dict[str, Any]]:
 def save_event_to_db(ev: Dict[str, Any]):
     """Persists a new appliance transition event to SQLite."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO events_log (timestamp, device_id, appliance, current_a, delta_i_a, power_w, vibration_g, latency_us, status, health_status)
@@ -206,7 +212,7 @@ def save_event_to_db(ev: Dict[str, Any]):
 def save_telemetry_to_db(t: Dict[str, Any]):
     """Downsampled telemetry logger."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO telemetry_history (timestamp, device_id, current_rms, voltage, power_w, vib_mag, predicted_appliance, breaker_status)
@@ -224,7 +230,7 @@ def save_telemetry_to_db(t: Dict[str, Any]):
 def save_audit_command_to_db(cmd: Dict[str, Any]):
     """Persists an authenticated remote control execution record."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO audit_commands (timestamp, command_id, action, operator, status, breaker_status, execution_time_ms)
@@ -242,7 +248,7 @@ def save_audit_command_to_db(cmd: Dict[str, Any]):
 def get_recent_audit_commands(limit: int = 15) -> List[Dict[str, Any]]:
     """Retrieves recent remote breaker commands for audit logging."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT id, timestamp, command_id, action, operator, status, breaker_status, execution_time_ms
@@ -270,7 +276,7 @@ def get_recent_audit_commands(limit: int = 15) -> List[Dict[str, Any]]:
 def get_db_metrics() -> Dict[str, Any]:
     """Returns row counts and database health."""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_db_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT count(*) FROM telemetry_history")
             t_count = cursor.fetchone()[0]
@@ -561,6 +567,10 @@ def on_mqtt_message(client, userdata, msg):
         raw_str = msg.payload.decode("utf-8")
         mqtt_status_info["last_msg"] = raw_str
         payload_dict = json.loads(raw_str)
+        if isinstance(payload_dict, str):
+            payload_dict = {"status": payload_dict}
+        elif not isinstance(payload_dict, dict):
+            return
 
         if msg.topic == MQTT_TOPIC_STATUS:
             # Handle node birth or Last-Will-and-Testament death
