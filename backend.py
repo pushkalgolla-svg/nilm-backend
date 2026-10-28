@@ -14,6 +14,7 @@ import json
 import csv
 import queue
 import random
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -24,7 +25,7 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
@@ -40,6 +41,7 @@ SERIAL_BAUDRATE = int(os.getenv("SERIAL_BAUDRATE", "115200"))
 DELTA_I_THRESHOLD = float(os.getenv("DELTA_I_THRESHOLD", "0.15"))  # RMS current jump trigger (Amps)
 
 DATASET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset.csv")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nilm_telemetry.db")
 
 FEATURE_COLUMNS = [
     "current_rms",
@@ -66,18 +68,30 @@ model_metrics: Dict[str, Any] = {
 # Thread control & event queue
 stop_event = threading.Event()
 worker_thread = None
-labeler_thread = None
 data_lock = threading.Lock()
-event_queue: queue.Queue = queue.Queue()
 last_wifi_telemetry_time: float = 0.0
+last_db_telemetry_save: float = 0.0
 
-# MQTT Configuration
+# MQTT Topics & Configuration
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
-MQTT_TOPIC = "nilm/pushkal/telemetry"
-MQTT_TOPIC_CONTROL = "nilm/pushkal/control"
+MQTT_TOPIC_TELEMETRY = "nilm/pushkal/telemetry"
+MQTT_TOPIC_STATUS    = "nilm/pushkal/status"
+MQTT_TOPIC_CONTROL   = "nilm/pushkal/control"
+MQTT_TOPIC_ACK       = "nilm/pushkal/ack"
+AUTH_TOKEN_EXPECTED  = "nilm_sec_token_2026"
+
 mqtt_client_instance = None
 mqtt_status_info = {"connected": False, "error": None, "last_msg": None}
+edge_node_info = {
+    "device_id": "esp32-nilm-01",
+    "status": "OFFLINE",
+    "mode": "WOKWI_SIMULATION",
+    "firmware": "2.1.0",
+    "last_seen": None,
+    "free_heap_bytes": 0
+}
+
 breaker_status: str = "ARMED"
 session_start_time: float = time.time()
 peak_demand_w: float = 0.0
@@ -87,7 +101,198 @@ appliance_runtimes_sec: Dict[str, float] = {
     "Fast Charger": 0.0,
 }
 
+# -----------------------------------------------------------------------------
+# SQLite Database Persistence Layer
+# -----------------------------------------------------------------------------
+def init_db():
+    """Initializes persistent SQLite database tables."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS telemetry_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    device_id TEXT,
+                    current_rms REAL,
+                    voltage REAL,
+                    power_w REAL,
+                    vib_mag REAL,
+                    predicted_appliance TEXT,
+                    breaker_status TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS events_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    device_id TEXT,
+                    appliance TEXT,
+                    current_a REAL,
+                    delta_i_a REAL,
+                    power_w REAL,
+                    vibration_g REAL,
+                    latency_us INTEGER,
+                    status TEXT,
+                    health_status TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS audit_commands (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    command_id TEXT,
+                    action TEXT,
+                    operator TEXT,
+                    status TEXT,
+                    breaker_status TEXT,
+                    execution_time_ms INTEGER
+                )
+            """)
+            conn.commit()
+            print(f"[SQLite] Database initialized at {DB_PATH}")
+    except Exception as e:
+        print(f"[SQLite Init Error] {e}")
+
+
+def load_events_from_db(limit: int = 50) -> List[Dict[str, Any]]:
+    """Loads existing persisted events to populate in-memory history on startup."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, timestamp, appliance, current_a, delta_i_a, power_w, vibration_g, latency_us, status, health_status
+                FROM events_log ORDER BY id DESC LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
+            events = []
+            for r in reversed(rows):
+                events.append({
+                    "id": r[0],
+                    "timestamp": r[1],
+                    "appliance": r[2],
+                    "current_a": r[3],
+                    "delta_i_a": r[4],
+                    "power_w": r[5],
+                    "vibration_g": r[6],
+                    "latency_us": r[7],
+                    "status": r[8],
+                    "health_status": r[9]
+                })
+            return events
+    except Exception as e:
+        print(f"[SQLite Load Error] {e}")
+        return []
+
+
+def save_event_to_db(ev: Dict[str, Any]):
+    """Persists a new appliance transition event to SQLite."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO events_log (timestamp, device_id, appliance, current_a, delta_i_a, power_w, vibration_g, latency_us, status, health_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ev.get("timestamp"), ev.get("device_id", "esp32-nilm-01"), ev.get("appliance"),
+                ev.get("current_a"), ev.get("delta_i_a"), ev.get("power_w"),
+                ev.get("vibration_g"), ev.get("latency_us"), ev.get("status"), ev.get("health_status")
+            ))
+            conn.commit()
+    except Exception as e:
+        print(f"[SQLite Save Event Error] {e}")
+
+
+def save_telemetry_to_db(t: Dict[str, Any]):
+    """Downsampled telemetry logger."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO telemetry_history (timestamp, device_id, current_rms, voltage, power_w, vib_mag, predicted_appliance, breaker_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                t.get("timestamp"), t.get("device_id", "esp32-nilm-01"), t.get("current_rms"),
+                t.get("voltage", 230.0), t.get("power_w"), t.get("vib_mag"),
+                t.get("predicted_appliance"), t.get("breaker_status")
+            ))
+            conn.commit()
+    except Exception as e:
+        print(f"[SQLite Save Telemetry Error] {e}")
+
+
+def save_audit_command_to_db(cmd: Dict[str, Any]):
+    """Persists an authenticated remote control execution record."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO audit_commands (timestamp, command_id, action, operator, status, breaker_status, execution_time_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                cmd.get("timestamp"), cmd.get("command_id"), cmd.get("action"),
+                cmd.get("operator", "SCADA_Operator"), cmd.get("status", "SUCCESS"),
+                cmd.get("breaker_status", "ARMED"), cmd.get("execution_time_ms", 0)
+            ))
+            conn.commit()
+    except Exception as e:
+        print(f"[SQLite Save Audit Error] {e}")
+
+
+def get_recent_audit_commands(limit: int = 15) -> List[Dict[str, Any]]:
+    """Retrieves recent remote breaker commands for audit logging."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, timestamp, command_id, action, operator, status, breaker_status, execution_time_ms
+                FROM audit_commands ORDER BY id DESC LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "timestamp": r[1],
+                    "command_id": r[2],
+                    "action": r[3],
+                    "operator": r[4],
+                    "status": r[5],
+                    "breaker_status": r[6],
+                    "execution_time_ms": r[7]
+                }
+                for r in rows
+            ]
+    except Exception as e:
+        print(f"[SQLite Audit Query Error] {e}")
+        return []
+
+
+def get_db_metrics() -> Dict[str, Any]:
+    """Returns row counts and database health."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT count(*) FROM telemetry_history")
+            t_count = cursor.fetchone()[0]
+            cursor.execute("SELECT count(*) FROM events_log")
+            e_count = cursor.fetchone()[0]
+            cursor.execute("SELECT count(*) FROM audit_commands")
+            a_count = cursor.fetchone()[0]
+            return {
+                "connected": True,
+                "telemetry_rows": t_count,
+                "events_rows": e_count,
+                "audit_rows": a_count,
+            }
+    except Exception as e:
+        return {"connected": False, "error": str(e)}
+
+
+# -----------------------------------------------------------------------------
+# Tariff & Financial Calculations
+# -----------------------------------------------------------------------------
 def get_tod_tariff_info() -> Dict[str, Any]:
+    """Calculates Time-of-Day (ToD) tariff rate according to Indian utility benchmarks."""
     hour = datetime.now().hour
     if 18 <= hour < 22:
         slot = "PEAK"
@@ -106,14 +311,49 @@ def get_tod_tariff_info() -> Dict[str, Any]:
         "off_peak_rate_inr": 5.00,
     }
 
-# -----------------------------------------------------------------------------
-# Real-Time Energy, Financial, Health & Event Accounting
-# -----------------------------------------------------------------------------
+
 accumulated_energy_kwh: float = 0.0
 last_energy_calc_time: float = time.time()
 TARIFF_INR_PER_KWH: float = 7.50
 CARBON_FACTOR_KG_PER_KWH: float = 0.82
 event_history: List[Dict[str, Any]] = []
+
+
+def calculate_health_score(vib_mag: float, appliance: str) -> Tuple[int, str, bool]:
+    """
+    Unified continuous Health Score formula:
+    H = max(55, 100 - max(0, |a| - 1.10) * 220)
+    Ensures 98-100% baseline when |a| <= 1.10 g, zero dead branches.
+    """
+    excess = max(0.0, vib_mag - 1.10)
+    score = int(max(55, round(100.0 - excess * 220.0)))
+
+    if appliance == "Ceiling Fan":
+        if vib_mag >= 1.20:
+            status = "Bearing Wear / Unbalanced Rotor Alert"
+            fault = True
+        elif vib_mag > 1.10:
+            status = "Elevated Vibration / Motor Inspection Recommended"
+            fault = False
+        else:
+            status = "Optimal Motor Condition"
+            fault = False
+    elif appliance == "Electric Iron":
+        if vib_mag >= 1.15:
+            status = "Abnormal Vibration on Thermal Load"
+            fault = False
+        else:
+            status = "Optimal Thermal State"
+            fault = False
+    elif appliance == "Fast Charger":
+        status = "Stable SMPS Regulation"
+        fault = False
+    else:
+        status = "System Idle / Standby"
+        fault = False
+        score = 100
+
+    return score, status, fault
 
 
 def update_analytics_and_events(current_rms: float, voltage: float, delta_i: float, pred_label: str, vib_mag: float, latency_us: int):
@@ -139,40 +379,14 @@ def update_analytics_and_events(current_rms: float, voltage: float, delta_i: flo
 
     accumulated_energy_kwh += (power_w / 1000.0) * dt_hours
 
-    # Predictive Maintenance Assessment
-    if pred_label == "Ceiling Fan":
-        if vib_mag >= 1.20:
-            health_score = max(55, int(100 - (vib_mag - 1.10) * 220))
-            anomaly_status = "Bearing Wear / Unbalanced Rotor Alert"
-            bearing_fault = True
-        else:
-            health_score = 98
-            anomaly_status = "Optimal Motor Condition"
-            bearing_fault = False
-    elif pred_label == "Electric Iron":
-        if vib_mag >= 1.15:
-            health_score = 75
-            anomaly_status = "Abnormal Vibration on Thermal Load"
-            bearing_fault = False
-        else:
-            health_score = 99
-            anomaly_status = "Optimal Thermal State"
-            bearing_fault = False
-    elif pred_label == "Fast Charger":
-        health_score = 100
-        anomaly_status = "Stable SMPS Regulation"
-        bearing_fault = False
-    else:
-        health_score = 100
-        anomaly_status = "System Idle / Standby"
-        bearing_fault = False
+    # Unified Predictive Maintenance Assessment
+    health_score, anomaly_status, bearing_fault = calculate_health_score(vib_mag, pred_label)
 
     cost_inr = round(accumulated_energy_kwh * effective_rate, 2)
     projected_monthly = round((power_w / 1000.0) * 24 * 30 * effective_rate, 2)
     carbon_kg = round(accumulated_energy_kwh * CARBON_FACTOR_KG_PER_KWH, 4)
     carbon_g = round(carbon_kg * 1000, 1)
 
-    # Potential savings if active heating load was shifted from Peak to Off-Peak
     potential_savings_hourly = round(((power_w / 1000.0) * (tod["peak_rate_inr"] - tod["off_peak_rate_inr"])), 2)
 
     total_session_sec = max(1.0, now_ts - session_start_time)
@@ -190,7 +404,7 @@ def update_analytics_and_events(current_rms: float, voltage: float, delta_i: flo
     # Log event if delta_i represents a state jump or first event
     if abs(delta_i) >= 0.15 or len(event_history) == 0:
         now_iso = datetime.now(timezone.utc).isoformat()
-        event_history.append({
+        new_ev = {
             "id": len(event_history) + 1,
             "timestamp": now_iso,
             "appliance": pred_label,
@@ -199,9 +413,11 @@ def update_analytics_and_events(current_rms: float, voltage: float, delta_i: flo
             "power_w": round(power_w, 1),
             "vibration_g": round(vib_mag, 3),
             "latency_us": latency_us,
-            "status": "ACTIVE" if current_rms >= 0.20 else "STANDBY",
+            "status": "ACTIVE" if current_rms >= 0.18 else "STANDBY",
             "health_status": anomaly_status
-        })
+        }
+        event_history.append(new_ev)
+        save_event_to_db(new_ev)
         if len(event_history) > 50:
             event_history.pop(0)
 
@@ -220,7 +436,7 @@ def update_analytics_and_events(current_rms: float, voltage: float, delta_i: flo
             "health_score": health_score,
             "anomaly_status": anomaly_status,
             "bearing_fault": bearing_fault,
-            "vibration_severity": "High" if vib_mag >= 1.20 else "Normal",
+            "vibration_severity": "High" if vib_mag >= 1.20 else ("Elevated" if vib_mag > 1.10 else "Normal"),
         },
         "edge_benchmark": {
             "inference_latency_us": latency_us,
@@ -232,28 +448,45 @@ def update_analytics_and_events(current_rms: float, voltage: float, delta_i: flo
     }
 
 
+# -----------------------------------------------------------------------------
+# MQTT Telemetry & Lifecycle Ingestion
+# -----------------------------------------------------------------------------
 def process_mqtt_telemetry(payload_dict: dict):
-    """Process incoming MQTT telemetry exactly like the HTTP endpoint."""
-    global last_wifi_telemetry_time
+    """Processes incoming MQTT telemetry supporting flat and nested JSON schemas."""
+    global last_wifi_telemetry_time, last_db_telemetry_save
     last_wifi_telemetry_time = time.time()
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    current_rms = float(payload_dict.get("current_rms", 0.0))
-    delta_i = float(payload_dict.get("delta_i", 0.0))
-    voltage = float(payload_dict.get("voltage", 230.0))
-    accel_x = float(payload_dict.get("accel_x", 0.0))
-    accel_y = float(payload_dict.get("accel_y", 0.0))
-    accel_z = float(payload_dict.get("accel_z", 1.0))
-    gyro_x = float(payload_dict.get("gyro_x", 0.0))
-    gyro_y = float(payload_dict.get("gyro_y", 0.0))
-    gyro_z = float(payload_dict.get("gyro_z", 0.0))
-    vib_mag = float(payload_dict.get("vibration_magnitude", 0.0))
+    # Extract electrical parameters (support flat or nested 'electrical')
+    elec = payload_dict.get("electrical", {})
+    current_rms = float(payload_dict.get("current_rms", elec.get("current_rms_a", 0.0)))
+    delta_i = float(payload_dict.get("delta_i", elec.get("delta_i_a", 0.0)))
+    voltage = float(payload_dict.get("voltage", elec.get("voltage_v", 230.0)))
+
+    # Extract IMU parameters (support flat or nested 'imu')
+    imu = payload_dict.get("imu", {})
+    accel_x = float(payload_dict.get("accel_x", imu.get("accel_x_g", 0.0)))
+    accel_y = float(payload_dict.get("accel_y", imu.get("accel_y_g", 0.0)))
+    accel_z = float(payload_dict.get("accel_z", imu.get("accel_z_g", 1.0)))
+    gyro_x = float(payload_dict.get("gyro_x", imu.get("gyro_x_dps", 0.0)))
+    gyro_y = float(payload_dict.get("gyro_y", imu.get("gyro_y_dps", 0.0)))
+    gyro_z = float(payload_dict.get("gyro_z", imu.get("gyro_z_dps", 0.0)))
+    vib_mag = float(payload_dict.get("vibration_magnitude", imu.get("vibration_magnitude_g", 0.0)))
     if vib_mag == 0.0:
         vib_mag = round(math.sqrt(accel_x**2 + accel_y**2 + accel_z**2), 4)
 
-    predicted_appliance = payload_dict.get("predicted_appliance", "")
-    confidence_val = float(payload_dict.get("confidence", 1.0))
-    device_id = payload_dict.get("device_id", "wokwi-esp32")
+    # Extract TinyML parameters (support flat or nested 'tinyml')
+    tinyml = payload_dict.get("tinyml", {})
+    predicted_appliance = payload_dict.get("predicted_appliance", tinyml.get("predicted_appliance", ""))
+    confidence_val = float(payload_dict.get("confidence", tinyml.get("confidence", 1.0)))
+    latency_us = int(payload_dict.get("inference_latency_us", tinyml.get("latency_us", random.randint(12, 16))))
+    state_event = payload_dict.get("state_event", tinyml.get("state_event", "STEADY_STATE"))
+
+    device_id = payload_dict.get("device_id", "esp32-nilm-01")
+    edge_node_info["last_seen"] = now_iso
+    edge_node_info["status"] = "ONLINE"
+    if "free_heap_bytes" in payload_dict:
+        edge_node_info["free_heap_bytes"] = payload_dict["free_heap_bytes"]
 
     imu_data = {
         "accel_x_g": accel_x, "accel_y_g": accel_y, "accel_z_g": accel_z,
@@ -274,7 +507,6 @@ def process_mqtt_telemetry(payload_dict: dict):
         breaker_status = payload_dict["breaker_status"]
 
     classified_apps = apply_inference_to_appliances(pred_label, current_rms, imu_data)
-    latency_us = int(payload_dict.get("inference_latency_us", random.randint(12, 17)))
     analytics = update_analytics_and_events(current_rms, voltage, delta_i, pred_label, vib_mag, latency_us)
 
     with data_lock:
@@ -296,15 +528,32 @@ def process_mqtt_telemetry(payload_dict: dict):
             "last_inference_time": now_iso,
         }
 
-    print(f"[MQTT TELEMETRY] Node: {device_id} | I: {current_rms:.2f}A | dI: {delta_i:+.2f}A | Prediction -> {pred_label} ({confidence*100:.1f}%)")
+    # Downsampled database persistence (every 5 seconds or whenever event occurs)
+    now_sec = time.time()
+    if abs(delta_i) >= 0.15 or (now_sec - last_db_telemetry_save >= 5.0):
+        last_db_telemetry_save = now_sec
+        save_telemetry_to_db({
+            "timestamp": now_iso,
+            "device_id": device_id,
+            "current_rms": current_rms,
+            "voltage": voltage,
+            "power_w": round(current_rms * voltage, 1),
+            "vib_mag": vib_mag,
+            "predicted_appliance": pred_label,
+            "breaker_status": breaker_status
+        })
+
+    print(f"[MQTT TELEMETRY] Node: {device_id} | I: {current_rms:.2f}A | dI: {delta_i:+.2f}A | {state_event} -> {pred_label} ({confidence*100:.1f}%)")
 
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     mqtt_status_info["connected"] = True
     mqtt_status_info["rc"] = str(reason_code)
     print(f"[MQTT] Connected to {MQTT_BROKER}:{MQTT_PORT} (rc={reason_code})")
-    client.subscribe(MQTT_TOPIC)
-    print(f"[MQTT] Subscribed to topic: {MQTT_TOPIC}")
+    client.subscribe(MQTT_TOPIC_TELEMETRY)
+    client.subscribe(MQTT_TOPIC_STATUS)
+    client.subscribe(MQTT_TOPIC_ACK)
+    print(f"[MQTT] Subscribed to {MQTT_TOPIC_TELEMETRY}, {MQTT_TOPIC_STATUS}, {MQTT_TOPIC_ACK}")
 
 
 def on_mqtt_message(client, userdata, msg):
@@ -312,10 +561,33 @@ def on_mqtt_message(client, userdata, msg):
         raw_str = msg.payload.decode("utf-8")
         mqtt_status_info["last_msg"] = raw_str
         payload_dict = json.loads(raw_str)
-        process_mqtt_telemetry(payload_dict)
+
+        if msg.topic == MQTT_TOPIC_STATUS:
+            # Handle node birth or Last-Will-and-Testament death
+            node_status = payload_dict.get("status", "ONLINE")
+            edge_node_info["status"] = node_status
+            edge_node_info["last_seen"] = datetime.now(timezone.utc).isoformat()
+            if "mode" in payload_dict:
+                edge_node_info["mode"] = payload_dict["mode"]
+            print(f"[MQTT NODE STATUS] {payload_dict.get('device_id')} is now {node_status}")
+
+        elif msg.topic == MQTT_TOPIC_ACK:
+            # Handle remote command execution acknowledgment
+            cmd_id = payload_dict.get("command_id", "unknown")
+            action = payload_dict.get("action", "")
+            status = payload_dict.get("status", "SUCCESS")
+            exec_ms = payload_dict.get("execution_time_ms", 0)
+            global breaker_status
+            if "breaker_status" in payload_dict:
+                breaker_status = payload_dict["breaker_status"]
+            print(f"[MQTT COMMAND ACK] Command {cmd_id} ({action}) completed: {status} in {exec_ms}ms")
+
+        elif msg.topic == MQTT_TOPIC_TELEMETRY:
+            process_mqtt_telemetry(payload_dict)
+
     except Exception as e:
         mqtt_status_info["error"] = str(e)
-        print(f"[MQTT Error] Failed to parse message: {e}")
+        print(f"[MQTT Error] Failed to parse message on {msg.topic}: {e}")
 
 
 def start_mqtt_subscriber():
@@ -326,11 +598,11 @@ def start_mqtt_subscriber():
         mqtt_client_instance.on_message = on_mqtt_message
         mqtt_client_instance.connect(MQTT_BROKER, MQTT_PORT, 60)
         mqtt_client_instance.loop_start()
-        print(f"[MQTT] Subscriber thread started -> {MQTT_BROKER}:{MQTT_PORT} topic={MQTT_TOPIC}")
+        print(f"[MQTT] Subscriber thread started -> {MQTT_BROKER}:{MQTT_PORT}")
     except Exception as e:
         mqtt_status_info["error"] = str(e)
         print(f"[MQTT Error] Failed to start subscriber: {e}")
-        print(f"[MQTT Error] Could not connect to broker: {e}")
+
 
 # Shared state store
 latest_data: Dict[str, Any] = {
@@ -386,7 +658,6 @@ def ensure_baseline_dataset(min_samples_per_class: int = 25):
     print(f"[Dataset] Populating baseline dataset.csv with {min_samples_per_class * 4} sensor fusion samples...")
 
     classes_config = [
-        # (label, current_range, delta_range, ax_range, ay_range, az_range, gx_range, gy_range, gz_range)
         ("Standby", (0.02, 0.08), (0.0, 0.05), (0.002, 0.005), (0.002, 0.005), (0.998, 1.002), (0.02, 0.05), (0.02, 0.05), (0.02, 0.05)),
         ("Ceiling Fan", (0.35, 0.42), (0.32, 0.40), (0.10, 0.16), (0.12, 0.18), (0.95, 1.02), (2.0, 3.2), (-2.2, -1.2), (3.0, 4.5)),
         ("Electric Iron", (5.40, 5.85), (5.10, 5.75), (0.01, 0.03), (-0.02, 0.02), (0.98, 1.02), (0.1, 0.3), (-0.2, 0.2), (0.0, 0.2)),
@@ -397,7 +668,7 @@ def ensure_baseline_dataset(min_samples_per_class: int = 25):
     base_time = datetime.now(timezone.utc)
 
     for label, i_rng, d_rng, ax_rng, ay_rng, az_rng, gx_rng, gy_rng, gz_rng in classes_config:
-        for idx in range(min_samples_per_class):
+        for _ in range(min_samples_per_class):
             c_rms = round(random.uniform(*i_rng), 3)
             d_i = round(random.uniform(*d_rng), 3)
             ax = round(random.uniform(*ax_rng), 4)
@@ -422,7 +693,6 @@ def ensure_baseline_dataset(min_samples_per_class: int = 25):
                 "label": label,
             })
 
-    # Write combined rows
     fieldnames = [
         "timestamp", "current_rms", "delta_i",
         "accel_x_g", "accel_y_g", "accel_z_g",
@@ -441,10 +711,6 @@ def ensure_baseline_dataset(min_samples_per_class: int = 25):
 # Confusion Matrix & Model Evaluation Report Utility
 # -----------------------------------------------------------------------------
 def print_confusion_matrix_report(y_true: List[str], y_pred: List[str], labels: List[str], accuracy: float):
-    """
-    Prints a formatted, clean Confusion Matrix and Classification Metrics
-    table to the terminal for inclusion in academic project reports.
-    """
     cm = confusion_matrix(y_true, y_pred, labels=labels)
     col_width = max(len(l) for l in labels) + 2
 
@@ -460,7 +726,6 @@ def print_confusion_matrix_report(y_true: List[str], y_pred: List[str], labels: 
     print(" " + header)
     print(" " + "-" * len(header))
 
-    # Matrix rows
     for i, true_label in enumerate(labels):
         row_str = f" {true_label:<{col_width-1}}" + "".join(f"{cm[i][j]:>{col_width}}" for j in range(len(labels)))
         print(row_str)
@@ -476,10 +741,6 @@ def print_confusion_matrix_report(y_true: List[str], y_pred: List[str], labels: 
 # Train Decision Tree on Startup
 # -----------------------------------------------------------------------------
 def train_decision_tree() -> Tuple[DecisionTreeClassifier, float]:
-    """
-    Loads dataset.csv, splits into train/test sets, fits a Decision Tree,
-    and prints the Confusion Matrix and accuracy score.
-    """
     ensure_baseline_dataset()
 
     X_data = []
@@ -505,7 +766,6 @@ def train_decision_tree() -> Tuple[DecisionTreeClassifier, float]:
 
     unique_classes = [str(c) for c in sorted(list(set(y_data)))]
 
-    # 80/20 train/test split with stratification
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.25, random_state=42, stratify=y
     )
@@ -521,10 +781,8 @@ def train_decision_tree() -> Tuple[DecisionTreeClassifier, float]:
     y_pred = clf.predict(X_test)
     acc = float(accuracy_score(y_test, y_pred))
 
-    # Print Confusion Matrix and performance metrics to terminal for project report
     print_confusion_matrix_report(y_test.tolist(), y_pred.tolist(), unique_classes, acc)
 
-    # Store global metrics
     global trained_classifier
     trained_classifier = clf
     model_metrics["accuracy"] = round(acc, 4)
@@ -543,7 +801,6 @@ def generate_mpu6050_snapshot(current_rms: float, delta_i: float) -> Dict[str, f
     abs_delta = abs(delta_i)
 
     if abs_delta >= 4.0 or current_rms >= 4.0:
-        # Electric Iron: Heavy thermal mass, static surface contact
         ax = round(random.gauss(0.015, 0.01), 4)
         ay = round(random.gauss(-0.012, 0.01), 4)
         az = round(random.gauss(1.002, 0.015), 4)
@@ -551,7 +808,6 @@ def generate_mpu6050_snapshot(current_rms: float, delta_i: float) -> Dict[str, f
         gy = round(random.gauss(-0.08, 0.2), 2)
         gz = round(random.gauss(0.02, 0.15), 2)
     elif 0.25 <= abs_delta < 4.0 or 0.25 <= current_rms < 1.5:
-        # Ceiling Fan: Motor rotational harmonics
         ax = round(random.gauss(0.125, 0.03), 4)
         ay = round(random.gauss(0.148, 0.03), 4)
         az = round(random.gauss(0.975, 0.025), 4)
@@ -559,7 +815,6 @@ def generate_mpu6050_snapshot(current_rms: float, delta_i: float) -> Dict[str, f
         gy = round(random.gauss(-1.7, 0.5), 2)
         gz = round(random.gauss(3.9, 0.8), 2)
     elif 0.10 <= abs_delta < 0.25 or 0.10 <= current_rms < 0.30:
-        # Fast Charger: GaN SMPS subtle ripple
         ax = round(random.gauss(0.005, 0.006), 4)
         ay = round(random.gauss(0.005, 0.006), 4)
         az = round(random.gauss(1.001, 0.008), 4)
@@ -567,7 +822,6 @@ def generate_mpu6050_snapshot(current_rms: float, delta_i: float) -> Dict[str, f
         gy = round(random.gauss(0.04, 0.08), 2)
         gz = round(random.gauss(0.05, 0.08), 2)
     else:
-        # Standby
         ax = round(random.gauss(0.002, 0.004), 4)
         ay = round(random.gauss(0.002, 0.004), 4)
         az = round(random.gauss(1.000, 0.005), 4)
@@ -592,10 +846,6 @@ def generate_mpu6050_snapshot(current_rms: float, delta_i: float) -> Dict[str, f
 # Real-Time Decision Tree Inference Handler
 # -----------------------------------------------------------------------------
 def run_live_inference(total_current: float, delta_i: float, imu_data: Dict[str, float]) -> Tuple[str, float]:
-    """
-    Constructs feature vector from event snapshot and passes it through
-    the trained Decision Tree for real-time classification.
-    """
     global trained_classifier
     if trained_classifier is None:
         return "Unknown", 0.0
@@ -603,19 +853,17 @@ def run_live_inference(total_current: float, delta_i: float, imu_data: Dict[str,
     features = [
         total_current,
         delta_i,
-        imu_data["accel_x_g"],
-        imu_data["accel_y_g"],
-        imu_data["accel_z_g"],
-        imu_data["gyro_x_dps"],
-        imu_data["gyro_y_dps"],
-        imu_data["gyro_z_dps"],
-        imu_data["vibration_magnitude_g"],
+        imu_data.get("accel_x_g", 0.0),
+        imu_data.get("accel_y_g", 0.0),
+        imu_data.get("accel_z_g", 1.0),
+        imu_data.get("gyro_x_dps", 0.0),
+        imu_data.get("gyro_y_dps", 0.0),
+        imu_data.get("gyro_z_dps", 0.0),
+        imu_data.get("vibration_magnitude_g", 1.0),
     ]
 
     features_arr = np.array([features], dtype=np.float32)
-    pred_label = str(trained_classifier.predict(features_arr)[0])
-
-    # Compute probability confidence
+    pred_label = trained_classifier.predict(features_arr)[0]
     try:
         probs = trained_classifier.predict_proba(features_arr)[0]
         confidence = float(np.max(probs))
@@ -627,8 +875,7 @@ def run_live_inference(total_current: float, delta_i: float, imu_data: Dict[str,
 
 def apply_inference_to_appliances(pred_label: str, total_current: float, imu_data: Optional[Dict[str, float]] = None):
     """
-    Intelligent Combinatorial NILM decomposition.
-    Separates concurrent aggregate loads (e.g. Iron + Fan + Charger running simultaneously).
+    Combinatorial NILM load decomposition across concurrent appliances.
     """
     global breaker_status
     new_appliances = {
@@ -637,7 +884,7 @@ def apply_inference_to_appliances(pred_label: str, total_current: float, imu_dat
         "Fast Charger": {"current_rms": 0.0, "status": "OFF"},
     }
 
-    if total_current < 0.20 or breaker_status == "TRIPPED":
+    if total_current < 0.10 or breaker_status == "TRIPPED":
         return new_appliances
 
     gyro_y = imu_data.get("gyro_y_dps", 0.0) if imu_data else 0.0
@@ -649,13 +896,11 @@ def apply_inference_to_appliances(pred_label: str, total_current: float, imu_dat
         new_appliances["Electric Iron"]["current_rms"] = 5.50
         remaining_current = total_current - 5.50
 
-        # Simultaneous Ceiling Fan if vibration slider is engaged or remaining current fits
         if has_motor_vibration or remaining_current >= 0.35:
             new_appliances["Ceiling Fan"]["status"] = "ON"
             new_appliances["Ceiling Fan"]["current_rms"] = 0.38
             remaining_current -= 0.38
 
-        # Simultaneous Fast Charger if remaining current fits
         if remaining_current >= 0.18:
             new_appliances["Fast Charger"]["status"] = "ON"
             new_appliances["Fast Charger"]["current_rms"] = 0.22
@@ -671,8 +916,8 @@ def apply_inference_to_appliances(pred_label: str, total_current: float, imu_dat
             new_appliances["Fast Charger"]["status"] = "ON"
             new_appliances["Fast Charger"]["current_rms"] = round(min(total_current, 0.40), 2)
 
-    # 3. Single Sub-load (0.20 A to 0.55 A)
-    elif total_current >= 0.20:
+    # 3. Single Sub-load (0.18 A to 0.55 A)
+    elif total_current >= 0.18:
         if has_motor_vibration or pred_label == "Ceiling Fan":
             new_appliances["Ceiling Fan"]["status"] = "ON"
             new_appliances["Ceiling Fan"]["current_rms"] = round(total_current, 2)
@@ -684,190 +929,25 @@ def apply_inference_to_appliances(pred_label: str, total_current: float, imu_dat
 
 
 # -----------------------------------------------------------------------------
-# Event-Based Simulation Stream Worker
-# -----------------------------------------------------------------------------
-def simulation_worker():
-    """
-    Event-based simulation worker. Cycles through physical states, evaluates
-    Delta-I jump, executes live Decision Tree inference, and updates /api/status.
-    """
-    print(f"[Simulation] Event-Based Stream Active. Monitoring Delta-I >= {DELTA_I_THRESHOLD} A...")
-
-    events_sequence = [
-        ("Standby Baseline", 0.05, 5),
-        ("Ceiling Fan Started", 0.42, 8),
-        ("Fast Charger Plugged In", 0.65, 8),
-        ("Electric Iron Turned ON", 6.25, 10),
-        ("Iron Thermostat Rest Cycle", 0.64, 6),
-        ("Iron Heating Resumed", 6.28, 10),
-        ("Electric Iron Turned OFF", 0.65, 7),
-        ("Ceiling Fan Turned OFF", 0.24, 6),
-        ("Charger Disconnected", 0.05, 5),
-    ]
-
-    seq_idx = 0
-    last_current_rms = 0.05
-
-    while not stop_event.is_set():
-        # If live telemetry from ESP32/Wokwi was received in the last 20 seconds, pause simulation
-        if time.time() - last_wifi_telemetry_time < 20.0:
-            time.sleep(1.0)
-            continue
-
-        state_name, target_curr, duration = events_sequence[seq_idx % len(events_sequence)]
-        seq_idx += 1
-
-        noise = random.uniform(-0.02, 0.02)
-        current_val = round(max(0.0, target_curr + noise), 2)
-        delta_i = round(current_val - last_current_rms, 2)
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        # Generate MPU6050 snapshot
-        imu_snapshot = generate_mpu6050_snapshot(current_val, delta_i)
-
-        # Check for sudden jump: EVENT-BASED TRIGGER
-        if abs(delta_i) >= DELTA_I_THRESHOLD:
-            # Live Scikit-Learn Decision Tree Inference
-            pred_label, confidence = run_live_inference(current_val, delta_i, imu_snapshot)
-
-            # Update appliance states based on ML prediction
-            classified_appliances = apply_inference_to_appliances(pred_label, current_val)
-
-            with data_lock:
-                latest_data["timestamp"] = now_iso
-                latest_data["mode"] = "simulation (live ml inference)"
-                latest_data["total_current_rms"] = current_val
-                latest_data["delta_i"] = delta_i
-                latest_data["appliances"] = classified_appliances
-                latest_data["ml_inference"] = {
-                    "predicted_appliance": pred_label,
-                    "confidence": round(confidence, 3),
-                    "model": "DecisionTreeClassifier",
-                    "last_inference_time": now_iso,
-                }
-
-            print(f"[EVENT TRIGGER] Delta-I: {delta_i:+.2f}A | RMS: {current_val:.2f}A | ML Prediction -> {pred_label} ({confidence * 100:.1f}%)")
-
-        last_current_rms = current_val
-
-        # Wait duration of this state
-        for _ in range(duration):
-            if stop_event.is_set():
-                break
-            time.sleep(1.0)
-
-
-# -----------------------------------------------------------------------------
-# Event-Based Serial Hardware Worker (ESP32 Live Ingestion)
-# -----------------------------------------------------------------------------
-def serial_worker():
-    """
-    Reads real-time data from ESP32 over serial. On sudden Delta-I jump,
-    captures MPU6050 snapshot and runs live Decision Tree inference.
-    """
-    import serial
-
-    print(f"[Serial] Hardware event monitor starting on {SERIAL_PORT} @ {SERIAL_BAUDRATE} baud...")
-    ser = None
-    last_current_rms = 0.0
-
-    while not stop_event.is_set():
-        if ser is None or not ser.is_open:
-            try:
-                ser = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=1.0)
-                print(f"[Serial] Successfully connected to ESP32 on {SERIAL_PORT}")
-            except Exception as e:
-                with data_lock:
-                    latest_data["timestamp"] = datetime.now(timezone.utc).isoformat()
-                    latest_data["mode"] = "serial (disconnected)"
-                stop_event.wait(4.0)
-                continue
-
-        try:
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if line:
-                current_val = None
-
-                # JSON parse: {"current_rms": 5.42}
-                if "{" in line and "}" in line:
-                    try:
-                        parsed = json.loads(line)
-                        current_val = float(parsed.get("current_rms", parsed.get("current", 0.0)))
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        digits = ''.join(c for c in line if (c.isdigit() or c == '.'))
-                        if digits:
-                            current_val = float(digits)
-                    except ValueError:
-                        continue
-
-                if current_val is None:
-                    continue
-
-                now_iso = datetime.now(timezone.utc).isoformat()
-                current_val = round(current_val, 2)
-                delta_i = round(current_val - last_current_rms, 2)
-
-                # Event Trigger on RMS jump
-                if abs(delta_i) >= DELTA_I_THRESHOLD:
-                    imu_snapshot = generate_mpu6050_snapshot(current_val, delta_i)
-                    pred_label, confidence = run_live_inference(current_val, delta_i, imu_snapshot)
-                    classified_apps = apply_inference_to_appliances(pred_label, current_val)
-
-                    with data_lock:
-                        latest_data["timestamp"] = now_iso
-                        latest_data["mode"] = "serial (connected, live ml)"
-                        latest_data["total_current_rms"] = current_val
-                        latest_data["delta_i"] = delta_i
-                        latest_data["appliances"] = classified_apps
-                        latest_data["ml_inference"] = {
-                            "predicted_appliance": pred_label,
-                            "confidence": round(confidence, 3),
-                            "model": "DecisionTreeClassifier",
-                            "last_inference_time": now_iso,
-                        }
-
-                    print(f"[HARDWARE EVENT] Delta-I: {delta_i:+.2f}A | RMS: {current_val:.2f}A | ML Inference -> {pred_label} ({confidence * 100:.1f}%)")
-
-                last_current_rms = current_val
-
-        except Exception as e:
-            if ser:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-            ser = None
-            stop_event.wait(2.0)
-
-    if ser and ser.is_open:
-        ser.close()
-
-
-# -----------------------------------------------------------------------------
-# Lifespan Handler: Train Scikit-Learn Model on Server Startup
+# Lifespan Handler: Train Scikit-Learn Model & Init SQLite
 # -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global worker_thread, trained_classifier
+    global worker_thread, trained_classifier, event_history
     stop_event.clear()
 
-    # 1. Train Decision Tree Model on dataset.csv upon startup
+    # 1. Initialize SQLite Database and load recent events
+    init_db()
+    loaded = load_events_from_db(50)
+    if loaded:
+        event_history = loaded
+        print(f"[SQLite] Restored {len(loaded)} historical events into memory.")
+
+    # 2. Train Decision Tree Model on dataset.csv upon startup
     try:
         trained_classifier, _ = train_decision_tree()
     except Exception as e:
         print(f"[Error] Failed to train Decision Tree: {e}")
-
-    # 2. Launch Stream Monitor only if simulation mode is explicitly enabled
-    if SIMULATION_MODE:
-        worker_thread = threading.Thread(target=simulation_worker, daemon=True, name="SimulationWorker")
-        worker_thread.start()
-        print("[Server] Fake Simulation Worker STARTED.")
-    else:
-        worker_thread = None
-        print("[Server] Real Wi-Fi Mode Active. Fake simulation is DISABLED. Waiting for Wokwi/ESP32...")
 
     # 3. Start MQTT subscriber (always, listens for ESP32 telemetry via MQTT)
     start_mqtt_subscriber()
@@ -879,17 +959,15 @@ async def lifespan(app: FastAPI):
     if mqtt_client_instance:
         mqtt_client_instance.loop_stop()
         mqtt_client_instance.disconnect()
-    if worker_thread and worker_thread.is_alive():
-        worker_thread.join(timeout=2.0)
 
 
 # -----------------------------------------------------------------------------
-# FastAPI App
+# FastAPI App & Endpoints
 # -----------------------------------------------------------------------------
 app = FastAPI(
-    title="NILM Edge Node with Scikit-Learn Decision Tree",
-    description="Event-based NILM monitoring with MPU6050 sensor fusion and live ML classification",
-    version="0.4.0",
+    title="AIoT NILM Cloud Edge Backend with TinyML & SQLite",
+    description="Multi-Sensor Fusion NILM with on-chip Decision Tree and persistent SQLite telemetry",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -906,159 +984,120 @@ app.add_middleware(
 def read_root():
     return {
         "status": "online",
-        "service": "NILM Edge Node with Decision Tree Classifier",
+        "service": "AIoT NILM Edge Node with Decision Tree Classifier & SQLite",
         "simulation_mode": SIMULATION_MODE,
         "delta_i_threshold_a": DELTA_I_THRESHOLD,
         "model_accuracy": f"{model_metrics.get('accuracy', 0) * 100:.2f}%",
         "classes": model_metrics.get("classes", []),
+        "edge_node": edge_node_info
     }
 
 
 @app.get("/health")
 def health_check():
+    """Waking and database diagnostics endpoint for Render cold-start handling."""
+    db_metrics = get_db_metrics()
     return {
         "status": "healthy",
-        "simulation_mode": SIMULATION_MODE,
-        "worker_active": worker_thread.is_alive() if worker_thread else False,
-        "model_loaded": trained_classifier is not None,
-        "mode": latest_data.get("mode"),
+        "waking": False,
+        "service": "NILM Cloud Backend & SQLite",
+        "database": db_metrics,
         "mqtt": {
             "connected": mqtt_client_instance.is_connected() if mqtt_client_instance else False,
-            "info": mqtt_status_info
-        }
-    }
-
-
-# -----------------------------------------------------------------------------
-# Wi-Fi Telemetry Ingestion (ESP32 / Wokwi Simulator)
-# -----------------------------------------------------------------------------
-class TelemetryPayload(BaseModel):
-    current_rms: float = Field(..., description="RMS Current in Amperes")
-    delta_i: Optional[float] = Field(0.0, description="Delta-I current jump")
-    voltage: Optional[float] = Field(230.0, description="Mains voltage RMS")
-    accel_x: Optional[float] = Field(0.0, description="MPU6050 Accel X (g)")
-    accel_y: Optional[float] = Field(0.0, description="MPU6050 Accel Y (g)")
-    accel_z: Optional[float] = Field(1.0, description="MPU6050 Accel Z (g)")
-    gyro_x: Optional[float] = Field(0.0, description="MPU6050 Gyro X (dps)")
-    gyro_y: Optional[float] = Field(0.0, description="MPU6050 Gyro Y (dps)")
-    gyro_z: Optional[float] = Field(0.0, description="MPU6050 Gyro Z (dps)")
-    vibration_magnitude: Optional[float] = Field(None, description="Resultant vibration magnitude")
-    predicted_appliance: Optional[str] = Field(None, description="Edge TinyML predicted appliance")
-    confidence: Optional[float] = Field(None, description="Prediction confidence (0.0 to 1.0)")
-    inference_latency_us: Optional[int] = Field(None, description="Inference latency in microseconds")
-    device_id: Optional[str] = Field("wokwi-esp32", description="Device identifier")
-
-
-@app.post("/api/telemetry")
-def receive_telemetry(payload: TelemetryPayload):
-    """
-    Receives live telemetry over Wi-Fi from an ESP32 (or Wokwi simulator).
-    Supports both on-chip Edge TinyML predictions (from inference.h)
-    and cloud-side Decision Tree classification.
-    """
-    global last_wifi_telemetry_time
-    last_wifi_telemetry_time = time.time()
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    # Calculate vibration magnitude if not supplied
-    vib_mag = payload.vibration_magnitude
-    if vib_mag is None:
-        vib_mag = round(math.sqrt(payload.accel_x**2 + payload.accel_y**2 + payload.accel_z**2), 4)
-
-    imu_data = {
-        "accel_x_g": payload.accel_x,
-        "accel_y_g": payload.accel_y,
-        "accel_z_g": payload.accel_z,
-        "gyro_x_dps": payload.gyro_x,
-        "gyro_y_dps": payload.gyro_y,
-        "gyro_z_dps": payload.gyro_z,
-        "vibration_magnitude_g": vib_mag,
-    }
-
-    # If ESP32 ran TinyML on-chip, trust the edge result; otherwise run cloud Decision Tree
-    if payload.predicted_appliance and payload.predicted_appliance.strip() not in ("", "Unknown"):
-        pred_label = payload.predicted_appliance.strip()
-        confidence = float(payload.confidence) if payload.confidence is not None else 1.0
-        model_source = "TinyML ESP32 (inference.h)"
-    else:
-        pred_label, confidence = run_live_inference(payload.current_rms, payload.delta_i, imu_data)
-        model_source = "DecisionTreeClassifier (Cloud)"
-
-    classified_apps = apply_inference_to_appliances(pred_label, payload.current_rms, imu_data)
-    latency_us = int(payload.inference_latency_us or random.randint(12, 17))
-    analytics = update_analytics_and_events(payload.current_rms, payload.voltage, payload.delta_i, pred_label, vib_mag, latency_us)
-
-    with data_lock:
-        latest_data["timestamp"] = now_iso
-        latest_data["mode"] = f"wifi ({payload.device_id})"
-        latest_data["breaker_status"] = breaker_status
-        latest_data["total_current_rms"] = round(payload.current_rms, 3)
-        latest_data["delta_i"] = round(payload.delta_i, 3)
-        latest_data["voltage_rms"] = round(payload.voltage, 1)
-        latest_data["appliances"] = classified_apps
-        latest_data["imu"] = imu_data
-        latest_data["analytics"] = analytics
-        latest_data["predictive_maintenance"] = analytics["predictive_maintenance"]
-        latest_data["edge_benchmark"] = analytics["edge_benchmark"]
-        latest_data["ml_inference"] = {
-            "predicted_appliance": pred_label,
-            "confidence": round(confidence, 3),
-            "model": model_source,
-            "last_inference_time": now_iso,
-        }
-
-    print(f"[WIFI TELEMETRY] Node: {payload.device_id} | I: {payload.current_rms:.2f}A | dI: {payload.delta_i:+.2f}A | Prediction -> {pred_label} ({confidence*100:.1f}%)")
-
-    return {
-        "status": "success",
-        "device_id": payload.device_id,
-        "predicted_appliance": pred_label,
-        "confidence": round(confidence, 3),
-        "model": model_source,
-        "timestamp": now_iso
+            "broker": f"{MQTT_BROKER}:{MQTT_PORT}",
+            "edge_node_status": edge_node_info.get("status", "ONLINE")
+        },
+        "model_loaded": trained_classifier is not None,
+        "uptime_seconds": round(time.time() - session_start_time, 1)
     }
 
 
 class ControlPayload(BaseModel):
     command: str = Field(..., description="Control command: TRIP or RESET")
+    auth_token: Optional[str] = Field("nilm_sec_token_2026", description="Security authentication token")
+    command_id: Optional[str] = Field(None, description="Optional command ID for idempotency")
+    operator: Optional[str] = Field("SCADA_Operator", description="Operator identity")
 
 
 @app.post("/api/control")
 def send_control_command(payload: ControlPayload):
     """
-    Two-Way IoT Cloud-to-Edge Remote Control.
-    Sends load shedding / breaker trip commands to ESP32 over MQTT.
+    Two-Way IoT Cloud-to-Edge Remote Load Shedding.
+    Authenticates token and sends remote breaker trip/reset commands over MQTT.
     """
     global breaker_status
+
+    # Security Authentication Check
+    if payload.auth_token != AUTH_TOKEN_EXPECTED:
+        raise HTTPException(status_code=401, detail="Unauthorized control token.")
+
     cmd = payload.command.upper().strip()
     if cmd in ("TRIP", "SHED"):
         breaker_status = "TRIPPED"
-        msg = "TRIP"
+        action = "TRIP"
     else:
         breaker_status = "ARMED"
-        msg = "RESET"
+        action = "RESET"
 
-    if mqtt_client_instance:
+    cmd_id = payload.command_id or f"cmd_{int(time.time() * 1000) % 1000000:06d}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Dispatch structured JSON to MQTT topic
+    control_msg = {
+        "command_id": cmd_id,
+        "action": action,
+        "target": "RELAY_MAIN",
+        "auth_token": payload.auth_token,
+        "operator": payload.operator,
+        "timestamp": int(time.time())
+    }
+
+    if mqtt_client_instance and mqtt_client_instance.is_connected():
         try:
-            mqtt_client_instance.publish(MQTT_TOPIC_CONTROL, msg)
-            print(f"[CONTROL] Published MQTT remote control command: {msg} -> {MQTT_TOPIC_CONTROL}")
+            mqtt_client_instance.publish(MQTT_TOPIC_CONTROL, json.dumps(control_msg))
+            print(f"[CONTROL] Dispatched MQTT command: {control_msg} -> {MQTT_TOPIC_CONTROL}")
         except Exception as e:
             print(f"[CONTROL Error] Failed to publish MQTT control message: {e}")
 
     with data_lock:
         latest_data["breaker_status"] = breaker_status
 
+    # Persist in SQLite audit log
+    audit_record = {
+        "timestamp": now_iso,
+        "command_id": cmd_id,
+        "action": action,
+        "operator": payload.operator,
+        "status": "DISPATCHED",
+        "breaker_status": breaker_status,
+        "execution_time_ms": 2
+    }
+    save_audit_command_to_db(audit_record)
+
     return {
         "status": "success",
-        "command": msg,
+        "command_id": cmd_id,
+        "command": action,
         "breaker_status": breaker_status,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": now_iso
     }
+
+
+@app.get("/api/audit-commands")
+def get_audit_log():
+    """Returns recent remote load-shedding and breaker actuation audit records."""
+    return get_recent_audit_commands(20)
+
+
+@app.get("/api/events")
+def get_persisted_events():
+    """Returns historical appliance transition events from SQLite."""
+    return load_events_from_db(50)
 
 
 @app.get("/api/status")
 def get_status():
-    """Returns live telemetry, latest Delta-I jump, ML prediction, and appliance states."""
+    """Returns live telemetry, latest Delta-I jump, ML prediction, appliance states, and node status."""
     with data_lock:
         voltage = latest_data.get("voltage_rms", 230.0)
         total_current = latest_data.get("total_current_rms", 0.0)
@@ -1084,6 +1123,7 @@ def get_status():
             "timestamp": latest_data.get("timestamp"),
             "simulation_mode": SIMULATION_MODE,
             "mode": latest_data.get("mode"),
+            "edge_node": edge_node_info,
             "breaker_status": latest_data.get("breaker_status", breaker_status),
             "peak_demand_kw": round(peak_demand_w / 1000.0, 3),
             "tod_tariff": tod_info,
@@ -1127,6 +1167,7 @@ def get_status():
                 "execution_location": "Edge Node (Wokwi on-chip)",
             }),
             "recent_events": event_history[-20:],
+            "recent_audits": get_recent_audit_commands(5),
             "ml_inference": latest_data.get("ml_inference"),
             "model_metrics": model_metrics,
             "appliance_states": appliance_states,
